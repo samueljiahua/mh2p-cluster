@@ -1,0 +1,57 @@
+name: Build dio_cluster.so
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone QNX ARMv7 toolchain
+        run: |
+          git clone --depth=1 https://github.com/luka-dev/qnx65-armv7-toolchain.git qnx-toolchain
+
+      - name: Build QNX toolchain
+        run: |
+          cd qnx-toolchain
+          docker build \
+            --platform=linux/amd64 \
+            --target base-env \
+            --build-arg BASE=base-8.5 \
+            -t qnx65-armv7-toolchain:8.5 .
+
+      - name: Compile dio_cluster.so
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/src \
+            -w /src \
+            qnx65-armv7-toolchain:8.5 \
+            arm-unknown-nto-qnx6.5.0eabi-gcc \
+              -shared \
+              -fPIC \
+              -O2 \
+              -I/src/src/mib2q-carplay-rgi/c_hook/framework \
+              -I/src/src/mib2q-carplay-rgi/c_hook/routeguidance \
+              /src/src/dio_manager_preload.c \
+              /src/src/mib2q-carplay-rgi/c_hook/framework/pps_writer.c \
+              /src/src/mib2q-carplay-rgi/c_hook/routeguidance/rgd_tlv.c \
+              -ldl \
+              -lpthread \
+              -lc \
+              -o /src/dio_cluster.so
+
+      - name: Inspect output
+        run: |
+          file dio_cluster.so
+          ls -lh dio_cluster.so
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dio_cluster
+          path: dio_cluster.so
