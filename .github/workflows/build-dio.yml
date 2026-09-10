@@ -9,16 +9,44 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout mh2p-cluster
+        uses: actions/checkout@v5
 
       - name: Clone QNX ARMv7 toolchain
         run: |
           git clone --depth=1 https://github.com/luka-dev/qnx65-armv7-toolchain.git qnx-toolchain
 
+      - name: Patch expired Debian repository
+        run: |
+          cd qnx-toolchain
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("Dockerfile")
+          s = p.read_text()
+
+          old = "apt-get update"
+          new = "apt-get -o Acquire::Check-Valid-Until=false update"
+
+          count = s.count(old)
+
+          if count == 0:
+              raise SystemExit("ERROR: no apt-get update found in Dockerfile")
+
+          s = s.replace(old, new)
+          p.write_text(s)
+
+          print("Patched apt-get update occurrences:", count)
+          PY
+
+          echo "===== Verify Dockerfile patch ====="
+          grep -n "Check-Valid-Until" Dockerfile
+
       - name: Build QNX toolchain
         run: |
           cd qnx-toolchain
+
           docker build \
             --platform=linux/amd64 \
             --target base-env \
@@ -40,18 +68,23 @@ jobs:
               /src/src/dio_manager_preload.c \
               /src/src/mib2q-carplay-rgi/c_hook/framework/pps_writer.c \
               /src/src/mib2q-carplay-rgi/c_hook/routeguidance/rgd_tlv.c \
-              -ldl \
-              -lpthread \
               -lc \
               -o /src/dio_cluster.so
 
       - name: Inspect output
         run: |
+          echo "===== FILE TYPE ====="
           file dio_cluster.so
+
+          echo "===== FILE SIZE ====="
           ls -lh dio_cluster.so
 
-      - name: Upload artifact
+          echo "===== SHA256 ====="
+          sha256sum dio_cluster.so
+
+      - name: Upload dio_cluster.so
         uses: actions/upload-artifact@v4
         with:
           name: dio_cluster
           path: dio_cluster.so
+          if-no-files-found: error
