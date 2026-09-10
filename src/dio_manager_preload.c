@@ -234,6 +234,17 @@ static fn_identProcess_t real_identProcess = NULL;
 #define IDENT_TLV_RG_COMPONENT   0x001E
 #define RGD_COMPONENT_ID         0x0010
 
+/* AltScreen Probe V1
+ * iAP2 Identification Param 21 (0x0015), sub-parameter 17 (0x0011).
+ * This V1 is intentionally conservative:
+ *   - if Param 21 exists and sub17 is missing, append the 4-byte presence TLV
+ *     00 04 00 11 inside Param 21 and fix its length;
+ *   - if Param 21 does not exist, do NOT synthesize a whole Param 21 yet;
+ *   - keep all existing Route Guidance patching unchanged.
+ */
+#define IDENT_TLV_PARAM21_THEME_ASSETS   0x0015
+#define IDENT_PARAM21_SUB_THEME_ASSETS   0x0011
+
 /* ------------------------------------------------------------------ */
 /* PPS bridge — hook side: parse RG, publish to /pps/...               */
 /* Java side (CarPlayClusterIntegration) subscribes and pushes BAP.    */
@@ -703,6 +714,64 @@ static size_t build_rg_component_tlv(uint8_t *out, size_t max_len);
 static const uint16_t RG_SENT_MSGIDS[] = { 0x5200, 0x5203 };
 static const uint16_t RG_RECV_MSGIDS[] = { 0x5201, 0x5202, 0x5204 };
 
+/* Inspect nested TLVs inside Identification Param 21 (0x0015).
+ * Returns:
+ *   1  -> well-formed and sub17/0x0011 is present
+ *   0  -> well-formed and sub17/0x0011 is absent
+ *  -1  -> malformed nested TLV layout (leave Param 21 untouched)
+ */
+static int altscreen_param21_has_sub17(const uint8_t *tlv, size_t tlv_len) {
+    if (!tlv || tlv_len < 4) return -1;
+
+    size_t off = 4; /* skip Param 21 outer {len, tag} */
+    while (off < tlv_len) {
+        if (off + 4 > tlv_len) return -1;
+
+        uint16_t sub_len = (uint16_t)((tlv[off] << 8) | tlv[off + 1]);
+        uint16_t sub_tag = (uint16_t)((tlv[off + 2] << 8) | tlv[off + 3]);
+
+        if (sub_len < 4 || off + sub_len > tlv_len) return -1;
+        if (sub_tag == IDENT_PARAM21_SUB_THEME_ASSETS) return 1;
+
+        off += sub_len;
+    }
+    return 0;
+}
+
+static void log_altscreen_param21(const uint8_t *tlv, size_t tlv_len) {
+    if (!g_log_enabled || !tlv || tlv_len < 4) return;
+
+    int state = altscreen_param21_has_sub17(tlv, tlv_len);
+    if (state > 0) {
+        log_msg("ALTSCREEN: Param21/0x0015 found len=%zu; sub17/0x0011 PRESENT", tlv_len);
+    } else if (state == 0) {
+        log_msg("ALTSCREEN: Param21/0x0015 found len=%zu; sub17/0x0011 ABSENT", tlv_len);
+    } else {
+        log_msg("ALTSCREEN: Param21/0x0015 found len=%zu; nested TLV layout MALFORMED/UNKNOWN", tlv_len);
+    }
+
+    /* Log the nested tags as a compact diagnostic. */
+    pthread_mutex_lock(&g_log_mtx);
+    if (g_log) {
+        size_t off = 4;
+        int count = 0;
+        fprintf(g_log, "  ALTSCREEN Param21 nested:");
+        while (off + 4 <= tlv_len && count < 64) {
+            uint16_t sub_len = (uint16_t)((tlv[off] << 8) | tlv[off + 1]);
+            uint16_t sub_tag = (uint16_t)((tlv[off + 2] << 8) | tlv[off + 3]);
+            if (sub_len < 4 || off + sub_len > tlv_len) {
+                fprintf(g_log, " [BAD@%zu len=%u]", off, sub_len);
+                break;
+            }
+            fprintf(g_log, " {t=%04x l=%u}", sub_tag, sub_len);
+            off += sub_len;
+            count++;
+        }
+        fputc('\n', g_log);
+    }
+    pthread_mutex_unlock(&g_log_mtx);
+}
+
 static size_t rebuild_identify_with_rg(const uint8_t *in, size_t in_len,
                                        uint8_t *out, size_t out_max) {
     if (in_len < 6 || out_max < in_len + 256) return 0;
@@ -712,6 +781,7 @@ static size_t rebuild_identify_with_rg(const uint8_t *in, size_t in_len,
     memcpy(out, in, 6);
     size_t oo = 6;
     size_t io = 6;
+    int altscreen_param21_seen = 0;
 
     while (io + 4 <= in_len) {
         uint16_t tlv_len = (uint16_t)((in[io] << 8) | in[io+1]);
@@ -735,12 +805,53 @@ static size_t rebuild_identify_with_rg(const uint8_t *in, size_t in_len,
                 write_be16(out + eoff + 2*i, extra[i]);
             }
             oo += new_tlv_len;
+
+        } else if (tlv_tag == IDENT_TLV_PARAM21_THEME_ASSETS) {
+            altscreen_param21_seen = 1;
+            /* AltScreen Probe V1: only patch an EXISTING Param 21.
+             * The 0x0011 sub-parameter is a presence/void TLV:
+             *     00 04 00 11
+             */
+            int has_sub17 = altscreen_param21_has_sub17(in + io, tlv_len);
+            log_altscreen_param21(in + io, tlv_len);
+
+            if (has_sub17 == 0) {
+                size_t new_tlv_len = (size_t)tlv_len + 4;
+                if (new_tlv_len > 0xFFFF || oo + new_tlv_len > out_max) return 0;
+
+                write_be16(out + oo, (uint16_t)new_tlv_len);
+                write_be16(out + oo + 2, tlv_tag);
+                memcpy(out + oo + 4, in + io + 4, tlv_len - 4);
+
+                /* Append presence TLV: len=4, tag=0x0011. */
+                write_be16(out + oo + tlv_len, 4);
+                write_be16(out + oo + tlv_len + 2, IDENT_PARAM21_SUB_THEME_ASSETS);
+
+                log_msg("ALTSCREEN: inserted Param21 sub17 presence TLV: 00 04 00 11");
+                oo += new_tlv_len;
+            } else {
+                /* Already present, or nested layout is unknown/malformed:
+                 * preserve original Param 21 byte-for-byte. */
+                if (oo + tlv_len > out_max) return 0;
+                memcpy(out + oo, in + io, tlv_len);
+                oo += tlv_len;
+
+                if (has_sub17 > 0)
+                    log_msg("ALTSCREEN: no insertion needed; sub17 already present");
+                else
+                    log_msg("ALTSCREEN: Param21 left unchanged because nested layout is unknown/malformed");
+            }
+
         } else {
             if (oo + tlv_len > out_max) return 0;
             memcpy(out + oo, in + io, tlv_len);
             oo += tlv_len;
         }
         io += tlv_len;
+    }
+
+    if (!altscreen_param21_seen) {
+        log_msg("ALTSCREEN: Param21/0x0015 NOT FOUND; V1 will not synthesize it");
     }
 
     /* Append 0x001E RouteGuidanceDisplayComponent TLV. */
@@ -1083,7 +1194,7 @@ int _ZN4iap219CIAP2ControlSession13deployMessageERKNS_30CIAP2ControlSessionMessa
                     view[1] = (uint32_t)g_patched_ident;
                     view[2] = (uint32_t)(g_patched_ident + new_len);
 
-                    log_msg("IDENTIFY PATCHED: %zu -> %zu bytes (merged 0006/0007 + 001E)",
+                    log_msg("IDENTIFY PATCHED: %zu -> %zu bytes (RG 0006/0007 + 001E; AltScreen Probe V1 applied when Param21 exists)",
                             orig_len, new_len);
                     log_tlv_tags("IDENTIFY new", g_patched_ident, new_len);
                     log_hex("IDENTIFY new raw", g_patched_ident, new_len);
@@ -1281,7 +1392,7 @@ static void on_load(void) {
     fn_packet_dtor = (fn_packet_dtor_t)dlsym(RTLD_DEFAULT,
         "_ZN4iap211CIAP2PacketD1Ev");
 
-    log_msg("=== dio_manager_preload v1 loaded pid=%d ===", (int)getpid());
+    log_msg("=== dio_manager_preload AltScreen Probe V1 loaded pid=%d ===", (int)getpid());
     rg_pps_init();
     log_msg("  MessageView ctor = %p  (inject path via deployMessage)", (void*)fn_msgview_ctor_iter);
     log_msg("  deployPacket = %p  (legacy, unused)", (void*)fn_deploy_packet);
